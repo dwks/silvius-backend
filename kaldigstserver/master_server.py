@@ -15,6 +15,7 @@ import uuid
 import time
 import threading
 import functools
+import hashlib
 from Queue import Queue
 
 import tornado.ioloop
@@ -25,7 +26,14 @@ import tornado.gen
 import tornado.concurrent
 import settings
 import common
+import random
 
+#class Recognizer(tornado.websocket.Recognizer):
+#    def __init__(self):
+#        self.worker_list = set ()
+#        self.max_wrokers = 3
+#        self.recognizerID = random.randrange(1000,9999)
+#        self.socket = socket
 
 class Application(tornado.web.Application):
     def __init__(self):
@@ -41,13 +49,17 @@ class Application(tornado.web.Application):
             (r"/", MainHandler),
             (r"/client/ws/speech", DecoderSocketHandler),
             (r"/client/ws/status", StatusSocketHandler),
+            (r"/client/ws/register_grammar", RegisterGrammarSocketHandler),
             (r"/client/dynamic/reference", ReferenceHandler),
             (r"/client/dynamic/recognize", HttpChunkedRecognizeHandler),
             (r"/worker/ws/speech", WorkerSocketHandler),
+            (r"/recognizer/ws/speech",RecognizerSocketHandler),
             (r"/client/static/(.*)", tornado.web.StaticFileHandler, {'path': settings["static_path"]}),
         ]
         tornado.web.Application.__init__(self, handlers, **settings)
         self.available_workers = set()
+        self.available_recognizer = set()
+        self.connected_clients = set()
         self.status_listeners = set()
         self.num_requests_processed = 0
 
@@ -266,8 +278,14 @@ class WorkerSocketHandler(tornado.websocket.WebSocketHandler):
         if('announce-grammar' in event):
             self.grammar_list = event['announce-grammar']
             self.grammar = self.grammar_list[0]
+            self.recognizer_id = event['recognizer-id']  # NOT YET SAVED
             logging.info("Worker " + self.__str__() + " announced grammars " + str(self.grammar_list))
-        #announce grammar list in worker handle
+            for c in self.application.connected_clients:
+                if(not c.has_worker()):
+                    c.consider_worker(self)
+        elif('grammar-configured' in event):
+            assert self.client_socket is not None
+            self.client_socket.send_event(event)
         else:
             assert self.client_socket is not None
             self.client_socket.send_event(event)
@@ -281,6 +299,85 @@ class WorkerSocketHandler(tornado.websocket.WebSocketHandler):
     def get_grammar_list(self):
         return self.grammar_list
 
+
+class RecognizerSocketHandler(tornado.websocket.WebSocketHandler):
+    def __init__(self, application, request, **kwargs):
+        tornado.websocket.WebSocketHandler.__init__(self, application, request, **kwargs)
+        self.grammar = ''
+        self.grammar_list = []
+        self.recognizer_id = int(random.random() * 100000)
+
+    # needed for Tornado 4.0
+    def check_origin(self, origin):
+        return True
+
+    def open(self):
+        self.application.available_recognizer.add(self)
+        logging.info("New recognizer available " + self.__str__())
+        self.application.send_status_update()
+
+    def on_close(self):
+        logging.info("Worker " + self.__str__() + " leaving")
+        self.application.available_recognizer.discard(self)
+        self.application.send_status_update()
+
+    def on_message(self, message):
+        event = json.loads(message)
+        logging.info("Recognizer " + self.__str__() + " sent " + str(event))
+
+    def register_grammar(self, words):
+        h = hashlib.sha256()
+        for w in words:
+            h.update(w + "\n")
+        grammar = h.hexdigest()
+
+        logging.info("Registering grammar [" + grammar + "]")
+        obj = {'type': 'register-grammar', 'grammar': grammar, 'words': words}
+        message = json.dumps(obj)
+        self.write_message(message, binary=False)
+        return grammar
+
+    def launch_worker(self, grammar):
+        obj = {'type': 'launch-worker', 'grammar': grammar, 'recognizer': self.recognizer_id}
+        message = json.dumps(obj)
+        self.write_message(message, binary=False)
+
+
+class RegisterGrammarSocketHandler(tornado.web.RequestHandler):
+    #def __init__(self, application, request, **kwargs):
+        #tornado.websocket.WebSocketHandler.__init__(self, application, request, **kwargs)
+        #self.words = []
+
+    # needed for Tornado 4.0
+    #def check_origin(self, origin):
+        #return True
+
+    def open(self):
+        logging.info("Registering grammar... " + self.__str__())
+
+    def post(self, *args, **kwargs):
+        content_id = self.request.headers.get("Content-Id")
+        if content_id:
+            content = codecs.decode(self.request.body, "utf-8")
+            #self.words.extend(content.split())
+            rlist = self.application.available_recognizer
+            #r = random.choice(list(rlist.keys()))
+            r = rlist.pop()
+            rlist.add(r)
+            grammar = r.register_grammar(content.split())
+            self.write(grammar)
+            self.finish()
+        else:
+            self.set_status(400)
+            self.finish("No Content-Id specified")
+
+    #def on_close(self):
+        #rlist = self.application.available_recognizer
+        #r = random.choice(list(rlist.keys()))
+        #rlist[r].register_grammar(self.words)
+
+    #def on_message(self, message):
+        #self.words.extend(message.split())
 
 # client connects
 class DecoderSocketHandler(tornado.websocket.WebSocketHandler):
@@ -305,48 +402,73 @@ class DecoderSocketHandler(tornado.websocket.WebSocketHandler):
         self.content_id = self.get_argument("content-id", "none", True)
         self.grammar = self.get_argument("grammar", '', True)
         self.worker = None
-        try:
+        self.application.connected_clients.add(self)
+        logging.info("Loading audio ...")
 
+        w = self.find_worker()
+        if(w != None):
+            self.use_worker(w)
+        else:
+            #self.application.available_recognizer[0].launch_worker(self.grammar)
+            r = self.application.available_recognizer.pop()
+            self.application.available_recognizer.add(r)
+            r.launch_worker(self.grammar)
+
+    def has_worker(self):
+        return self.worker != None
+
+    def find_worker(self):  # returns new worker or None
+        try:
             #loop twice 
             #loop through workers
             # this set is frequently modified while we are iterating through it, make a copy
-            available_workers = set(self.application.available_workers)
-            for w in available_workers:
+            for w in self.application.available_workers:
                 if(self.grammar == w.get_grammar()):
-                    self.worker = w
-                    self.application.available_workers.discard(w)
-                    break
-            if self.worker == None:
-                for w in available_workers:
-                    for v in w.get_grammar_list():
-                        if(v == self.grammar):
-                            self.worker = w
-                            self.application.available_workers.discard(w)
-                            break
-#                if (w.get_grammar() == self.grammar):
-#                    self.worker = w
-#                    self.application.available_workers.discard(w)
-#                    break
-            if self.worker == None:
-                raise KeyError("no match for '" + self.grammar + "'")
-
-            self.application.send_status_update()
-            logging.info("%s: Using worker %s with grammar '%s'" % (self.id, self.__str__(), self.grammar))
-            self.worker.set_client_socket(self)
-
-            content_type = self.get_argument("content-type", None, True)
-            if content_type:
-                logging.info("%s: Using content type: %s" % (self.id, content_type))
-
-            self.worker.write_message(json.dumps(dict(id=self.id, content_type=content_type, user_id=self.user_id, content_id=self.content_id, requested_grammar=self.grammar)))
+                    return w
+            #if self.worker == None:
+            #    for w in self.application.available_workers:
+            #        for v in w.get_grammar_list():
+            #            if(v == self.grammar):
+            #                self.worker = w
+            #                break
+            #if self.worker == None:
+                #create a list of available_customer_worker
+                #create a heapq of available_customer_worker,index based on frequency/most recently used
+                #changed in to selected the recognizer
+                #self.worker = heappop(available_customer_recognizer)
+            #if self.worker:
+                #self.application.available_workers.discard(self.worker)
+            #else:
+                #raise KeyError("no match for '" + self.grammar + "'")
+            #self.use_worker(self.worker)
         except KeyError:
             logging.warn("%s: No worker available for client request with grammar '%s'" % (self.id, self.grammar))
             event = dict(status=common.STATUS_NOT_AVAILABLE, message="No decoder available for requested grammar, try again later")
             self.send_event(event)
             self.close()
+        return None
+    def consider_worker(self, worker):
+        if(self.grammar == worker.get_grammar()):
+            self.use_worker(worker)
+
+    def use_worker(self, worker):
+        self.worker = worker
+        self.application.available_workers.discard(worker)
+
+        self.application.send_status_update()
+        logging.info("%s: Using worker %s with grammar '%s'" % (self.id, self.__str__(), self.grammar))
+        self.worker.set_client_socket(self)
+
+        content_type = self.get_argument("content-type", None, True)
+        if content_type:
+            logging.info("%s: Using content type: %s" % (self.id, content_type))
+
+        self.worker.write_message(json.dumps(dict(requested_grammar=self.grammar)))
+        self.worker.write_message(json.dumps(dict(id=self.id, content_type=content_type, user_id=self.user_id, content_id=self.content_id)))
 
     def on_connection_close(self):
         logging.info("%s: Handling on_connection_close()" % self.id)
+        self.application.connected_clients.discard(self)
         self.application.num_requests_processed += 1
         self.application.send_status_update()
         if self.worker:
@@ -358,7 +480,8 @@ class DecoderSocketHandler(tornado.websocket.WebSocketHandler):
                 pass
 
     def on_message(self, message):
-        assert self.worker is not None
+        #assert self.worker is not None
+        if(self.worker is None): return
         logging.info("%s: Forwarding client message (%s) of length %d to worker" % (self.id, type(message), len(message)))
         if isinstance(message, unicode):
             self.worker.write_message(message, binary=False)

@@ -39,6 +39,8 @@ class SpeechDecoder:
         self.grammar = grammar
 
     def terminate(self):
+        print "TERMINATE SpeechDecoder"
+        #self.decoder_pipeline.destroy()
         self.decoder_pipeline = None
         if self.post_processor:
             self.post_processor.terminate()
@@ -104,6 +106,8 @@ class SpeechDecoderList:
             self.decoder_map[grammar] = None
         self.current_grammar = None
         self.current_decoder = None
+        import gc
+        gc.collect()
 
     def get_grammar(self):
         return self.current_grammar
@@ -117,15 +121,17 @@ class SpeechDecoderList:
 class ServerWebsocket(WebSocketClient):
     STATE_CREATED = 0
     STATE_CONNECTED = 1
-    STATE_INITIALIZED = 2
-    STATE_PROCESSING = 3
+    STATE_CONFIGURED = 2
+    STATE_INITIALIZED = 3
+    STATE_PROCESSING = 4
     STATE_EOS_RECEIVED = 7
     STATE_CANCELLING = 8
     STATE_FINISHED = 100
 
-    def __init__(self, uri, decoder_list):
+    def __init__(self, uri, decoder_list, recognizer_id):
         self.uri = uri
         self.decoder_list = decoder_list
+        self.recognizer_id = recognizer_id
         WebSocketClient.__init__(self, url=uri, heartbeat_freq=10)
         self.partial_transcript = ""
         self.state = self.STATE_CREATED
@@ -142,12 +148,14 @@ class ServerWebsocket(WebSocketClient):
         logger.info("Opened websocket connection to server")
         self.state = self.STATE_CONNECTED
         self.last_partial_result = ""
-        announcement = {'announce-grammar': self.decoder_list.get_grammar_list()}
+        announcement = {'announce-grammar': self.decoder_list.get_grammar_list(), 'recognizer-id': self.recognizer_id}
         self.send(json.dumps(announcement))
 
     def guard_timeout(self):
         global SILENCE_TIMEOUT
-        while self.state in [self.STATE_EOS_RECEIVED, self.STATE_CONNECTED, self.STATE_INITIALIZED, self.STATE_PROCESSING]:
+        while self.state in [self.STATE_EOS_RECEIVED, self.STATE_CONNECTED,
+            self.STATE_CONFIGURED, self.STATE_INITIALIZED, self.STATE_PROCESSING]:
+
             if time.time() - self.last_decoder_message > SILENCE_TIMEOUT:
                 logger.warning("%s: More than %d seconds from last decoder hypothesis update, cancelling" % (self.request_id, SILENCE_TIMEOUT))
                 self.finish_request()
@@ -166,27 +174,39 @@ class ServerWebsocket(WebSocketClient):
         logger.debug("%s: Got message from server of type %s" % (self.request_id, str(type(m))))
         if self.state == self.__class__.STATE_CONNECTED:
             props = json.loads(str(m))
+
+            if('requested_grammar' in props):
+                # Initialize decoder for requested grammar
+                if(not self.decoder_list.activate(props['requested_grammar'])):
+                    logger.error("%s: Client requested unsupported grammar '%s', disconnecting" % (self.request_id))
+                    self.state = self.STATE_FINISHED
+                    self.close()
+                    return
+                decoder_pipeline = self.get_decoder().decoder_pipeline
+                if USE_NNET2:
+                    decoder_pipeline.set_result_handler(self._on_result)
+                    decoder_pipeline.set_full_result_handler(self._on_full_result)
+                    decoder_pipeline.set_error_handler(self._on_error)
+                else:
+                    decoder_pipeline.set_word_handler(self._on_word)
+                    decoder_pipeline.set_error_handler(self._on_error)
+                decoder_pipeline.set_eos_handler(self._on_eos)
+
+            announcement = {'status': 0, 'grammar-configured': self.decoder_list.get_grammar()}
+            self.send(json.dumps(announcement))
+            self.state = self.STATE_CONFIGURED
+        elif self.state == self.__class__.STATE_CONFIGURED:
+            props = json.loads(str(m))
+
+            if('id' not in props):
+                return
+
             content_type = props['content_type']
             self.request_id = props['id']
             self.num_segments = 0
 
-            # Initialize decoder for requested grammar
-            if(not self.decoder_list.activate(props['requested_grammar'])):
-                logger.error("%s: Client requested unsupported grammar '%s', disconnecting" % (self.request_id))
-                self.state = self.STATE_FINISHED
-                self.close()
-                return
-            decoder_pipeline = self.get_decoder().decoder_pipeline
-            if USE_NNET2:
-                decoder_pipeline.set_result_handler(self._on_result)
-                decoder_pipeline.set_full_result_handler(self._on_full_result)
-                decoder_pipeline.set_error_handler(self._on_error)
-            else:
-                decoder_pipeline.set_word_handler(self._on_word)
-                decoder_pipeline.set_error_handler(self._on_error)
-            decoder_pipeline.set_eos_handler(self._on_eos)
-
-            decoder_pipeline.init_request(self.request_id, content_type)
+            self.get_decoder().decoder_pipeline.init_request(
+                self.request_id, content_type)
 
             self.last_decoder_message = time.time()
             thread.start_new_thread(self.guard_timeout, ())
@@ -410,6 +430,8 @@ def main():
     parser.add_argument('-u', '--uri', default="ws://localhost:8019/worker/ws/speech", dest="uri", help="Server<-->worker websocket URI")
     parser.add_argument('-f', '--fork', default=1, dest="fork", type=int)
     parser.add_argument('-c', '--conf', dest="conf", action='append', help="YAML file with decoder configuration")
+    parser.add_argument('-r', '--recognizer', dest="recognizer", default='manual', help="recognizer ID")
+    parser.add_argument('-g', '--grammar', dest="grammar", default='manual', help="grammar hash")
 
     args = parser.parse_args()
 
@@ -421,25 +443,37 @@ def main():
 
     decoder_list = SpeechDecoderList()
 
+#    for conf_file in args.conf:
+#        conf = {}
+#        with open(conf_file) as f:
+#            conf = yaml.safe_load(f)
+#        with open(conf_file) as f:
+#            h = hashlib.sha256()
+#            for line in f:
+#                h.update(line)
+#            grammar = h.hexdigest()
+#            print "HASH:", grammar
+#            decoder_list.add(conf, grammar)
+#        if "logging" in conf:
+#            logging.config.dictConfig(conf["logging"])
+    grammar = args.grammar
     for conf_file in args.conf:
         conf = {}
         with open(conf_file) as f:
             conf = yaml.safe_load(f)
-        with open(conf_file) as f:
-            h = hashlib.sha256()
-            for line in f:
-                h.update(line)
-            grammar = h.hexdigest()
-            print "HASH:", grammar
-            decoder_list.add(conf, grammar)
-        if "logging" in conf:
-            logging.config.dictConfig(conf["logging"])
+            decoder_list.add(conf, grammar, enabled=True)
 
+    #decoder_list.activate('4a1e67f2fe1d1cc7b31d0ca2ec441da4778203a036a77da10344c85e24ff0f92')
+    #decoder_list.activate('470002baf79149a60ec0d848a7ca17b79a6cb218647fe8202061566e0d09e827')
+    #decoder_list.activate('0087ee99c0faf8b7e12986176a8f0bcd88e852452bfa6937b6890eecc8a9dc2a')
+    #decoder_list.activate('470002baf79149a60ec0d848a7ca17b79a6cb218647fe8202061566e0d09e827')
+    #decoder_list.activate('0087ee99c0faf8b7e12986176a8f0bcd88e852452bfa6937b6890eecc8a9dc2a')
+    #return
 
     loop = GObject.MainLoop()
     thread.start_new_thread(loop.run, ())
     while True:
-        ws = ServerWebsocket(args.uri, decoder_list)
+        ws = ServerWebsocket(args.uri, decoder_list, args.recognizer)
         try:
             logger.info("Opening websocket connection to master server")
             ws.connect()
